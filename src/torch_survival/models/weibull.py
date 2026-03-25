@@ -178,7 +178,7 @@ class WeibullBase(SurvivalAnalysisMixin, BaseEstimator):
         y_time = torch.as_tensor(y_time.copy(), dtype=torch.float32, device=self.device)
 
         # Seed PyTorch random number generator
-        if self.random_state:
+        if self.random_state is not None:
             torch.manual_seed(self.random_state)
 
         # Normalize target time

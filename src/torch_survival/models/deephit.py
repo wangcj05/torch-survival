@@ -153,7 +153,7 @@ class DeepHit(SurvivalAnalysisMixin, BaseEstimator):
         y_event, y_time = check_array_survival(X, y)
 
         # Seed PyTorch random number generator
-        if self.random_state:
+        if self.random_state is not None:
             torch.manual_seed(self.random_state)
 
         # Optimize hyperparameters
