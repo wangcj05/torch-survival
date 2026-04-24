@@ -1,7 +1,5 @@
 import functools
 import warnings
-from copy import deepcopy
-from typing import TypedDict
 
 import optuna
 import torch
@@ -12,19 +10,10 @@ from sklearn.utils.validation import check_is_fitted, validate_data
 from sksurv.base import SurvivalAnalysisMixin
 from sksurv.util import check_array_survival
 
-from torch_survival.config import NetworkConfig, OptimizerConfig
 from torch_survival.losses import cox_neg_log_likelihood
 from torch_survival.metrics import concordance_index
 from torch_survival.progress import OptunaProgressCallback
-from torch_survival.sample import sample_network, sample_optimizer
-from torch_survival.utils import merge_configs
-
-
-class DeepSurvSearchSpace(TypedDict):
-    #: Neural network configuration
-    network: NetworkConfig
-    #: Optimizer configuration
-    optimizer: OptimizerConfig
+from torch_survival.sample import OptunaSampler, TunedTopology, TunedCategorical, TunedFloat
 
 
 class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
@@ -44,32 +33,62 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
     .. [1] J. L. Katzman, U. Shaham, A. Cloninger, J. Bates, T. Jiang, and Y. Kluger, “DeepSurv: personalized treatment
        recommender system using a Cox proportional hazards deep neural network,” BMC Med Res Methodol, vol. 18, no. 1,
        Feb. 2018, doi: 10.1186/s12874-018-0482-1. Available: http://dx.doi.org/10.1186/s12874-018-0482-1
+
+    Parameters
+    ----------
+    hidden_layer_sizes: list of ints or TunedTopology, default=TunedTopology(n_layers=4, n_neurons=50)
+        If a list, the ith element represents the number of neurons in the ith hidden layer. Alternatively, a tunable
+        topology specifies the maximum number of layers and of neurons per layer.
+    activation: {'relu', 'selu'} or TunedCategorical, default=TunedCategorical(choices=['relu', 'selu'])
+        Activation function for the hidden layer.
+    dropout: float or TunedFloat, default=TunedFloat(low=0.0, high=0.5)
+        Dropout probability for the hidden layer.
+    optimizer: {'sgd', 'adam'} or TunedCategorical, default=TunedCategorical(choices=['sgd', 'adam'])
+        Optimizer used for weight optimization.
+    learning_rate: float or TunedFloat, default=TunedFloat(low=1e-7, high=1e-3, log=True)
+        Initial learning rate used when optimizing weights.
+    momentum: float or TunedFloat, default=TunedFloat(low=0.8, high=0.95)
+        Momentum or first moment vector
+    scheduler: {'inverse_time'} or TunedCategorical, default='inverse_time'
+        Scheduler used for weight updates.
+    decay: float or TunedFloat(low=0.0, high=0.001)
+        Decay used by scheduler when updating learning rate.
+    n_epochs: int, default=500
+        Number of training epochs (how many times each data point will be used).
+    n_trials: int, default=50
+        Number of hyperparameter optimization trials. Only relevant if tunable parameters are passed.
+    random_state: int, default=None
+        Determines random number generation for hyperparameter optimization and weight initialization. Pass an int for
+        reproducible results across multiple function calls.
+    device: str or torch.device, default=None
+        Device on which tensors will be allocated. If None, uses CUDA if available, else CPU.
     """
 
-    #: Default hyperparameter search space
-    default_search_space: DeepSurvSearchSpace = {
-        'network': {
-            'layers': {
-                'max_layers': 4,
-                'max_nodes_per_layer': 50,
-            },
-            'activation': ['relu', 'selu'],
-            'dropout': (0.0, 0.5),
-        },
-        'optimizer': {
-            'name': ['sgd', 'adam'],
-            'lr': (1e-7, 1e-3),
-            'scheduler': 'inverse_time',
-            'decay': (0.0, 0.001),
-            'momentum': (0.8, 0.95),
-        },
-    }
-
-    def __init__(self, search_space: DeepSurvSearchSpace | None = None, n_epochs=500, random_state=None, device=None):
-        self.search_space = deepcopy(self.default_search_space)
-        if search_space:
-            self.search_space = merge_configs(self.search_space, search_space)
+    def __init__(
+            self,
+            hidden_layer_sizes=TunedTopology(n_layers=4, n_neurons=50),
+            activation=TunedCategorical(choices=['relu', 'selu']),
+            dropout=TunedFloat(low=0.0, high=0.5),
+            optimizer=TunedCategorical(choices=['sgd', 'adam']),
+            learning_rate=TunedFloat(low=1e-7, high=1e-3, log=True),
+            momentum=TunedFloat(low=0.8, high=0.95),
+            scheduler='inverse_time',
+            decay=TunedFloat(low=0.0, high=0.001),
+            n_epochs=500,
+            n_trials=50,
+            random_state=None,
+            device=None,
+    ):
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.activation = activation
+        self.dropout = dropout
+        self.optimizer = optimizer
+        self.learning_rate = learning_rate
+        self.momentum = momentum
+        self.scheduler = scheduler
+        self.decay = decay
         self.n_epochs = n_epochs
+        self.n_trials = n_trials
         self.random_state = random_state
         self.device = device
         if self.device is None:
@@ -87,10 +106,13 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         return - sum(scores) / len(scores)
 
     def _train(self, trial: optuna.Trial, X, y_event, y_time):
+        sampler = OptunaSampler(trial)
+
         # Set up model, optimizer, and scheduler
         n_inputs, n_outputs = X.shape[-1], 1
-        model = sample_network(trial, self.search_space['network'], n_inputs, n_outputs)
-        optimizer, scheduler = sample_optimizer(trial, self.search_space['optimizer'], model)
+        model = sampler.sample_network(n_inputs, n_outputs, self.hidden_layer_sizes, self.activation, self.dropout)
+        optimizer, scheduler = sampler.sample_optimizer(model, self.optimizer, self.learning_rate, self.momentum,
+                                                        self.scheduler, self.decay)
 
         # Pre-sort dataset based on time
         sort_idx = torch.argsort(y_time, descending=True)
