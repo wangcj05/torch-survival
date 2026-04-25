@@ -52,7 +52,7 @@ class TunedNeuralNetwork(nn.Module):
 
 
 class OptunaSampler:
-    def __init__(self, trial: optuna.Trial):
+    def __init__(self, trial: optuna.Trial | None):
         self.trial = trial
 
     def sample_int(self, name: str, value: int | TunedInt) -> int:
@@ -84,8 +84,8 @@ class OptunaSampler:
             dropout: float | TunedFloat,
     ) -> TunedNeuralNetwork:
         if not isinstance(layers, list):
-            n_layers = self.trial.suggest_int('layers', 0, layers['n_layers'])
-            layers = [self.trial.suggest_int('neurons_' + str(i + 1), 1, layers['n_neurons']) for i in
+            n_layers = self.trial.suggest_int('n_layers', 0, layers['n_layers'])
+            layers = [self.trial.suggest_int('n_neurons_' + str(i + 1), 1, layers['n_neurons']) for i in
                       range(n_layers)]
         activation = self.sample_categorical('activation', activation)
         dropout = self.sample_float('dropout', dropout)

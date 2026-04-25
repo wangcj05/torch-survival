@@ -105,7 +105,7 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
             scores.append(c_index)
         return - sum(scores) / len(scores)
 
-    def _train(self, trial: optuna.Trial, X, y_event, y_time):
+    def _train(self, trial: optuna.Trial | None, X, y_event, y_time):
         sampler = OptunaSampler(trial)
 
         # Set up model, optimizer, and scheduler
@@ -170,9 +170,14 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
             study.optimize(objective, n_trials=50, callbacks=[callback])
 
         # Train final model with best hyperparameters
-        self.optuna_params_ = study.best_params
         self.model_ = self._train(study.best_trial, X, y_event, y_time)
         self.model_.eval()
+
+        # Override internal parameters with tuned hyperparameters
+        best_params = study.best_params
+        best_params['hidden_layer_sizes'] = [best_params.pop('n_neurons_' + str(i + 1)) for i in
+                                             range(best_params.pop('n_layers'))]
+        self.set_params(**best_params)
 
         return self
 
@@ -198,5 +203,53 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         X = torch.as_tensor(X, dtype=torch.float32, device=self.device)
         return self.model_(X).detach().squeeze(dim=-1).cpu().numpy()
 
-    def get_optuna_params(self):
-        return self.optuna_params_
+    def save(self, path):
+        """ Save a trained model to disk.
+
+        This saves the model's parameters (dictionary) and weights (tensors) such that the estimator can be fully
+        restored using :meth:`DeepSurv.load`. Internally relies on :meth:`torch.save`.
+
+        Parameters
+        ----------
+        path: str or file-like object or os.PathLike
+            Path at which to save the model.
+        """
+        check_is_fitted(self)
+        state = {
+            'params': self.get_params(),
+            'model': self.model_.state_dict(),
+        }
+        torch.save(state, path)
+
+    @classmethod
+    def load(cls, path, device=None):
+        """ Reload an already trained model.
+
+        Parameters
+        ----------
+        path: str or file-like object or os.PathLike
+            Path from which to load the model. See also :meth:`DeepSurv.save` for additional details.
+        device: str or torch.device, default=None
+            Device on which tensors will be allocated. If None, uses CUDA if available, else CPU.
+
+        Returns
+        -------
+        model: DeepSurv
+            The trained estimator.
+        """
+        # Note: Device handled manually as users may wish to use a device different from the original when restoring
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        state = torch.load(path, map_location=device, weights_only=True)
+        # Reload estimator with initial parameters
+        params = state['params']
+        params['device'] = device
+        estimator = cls(**params)
+        # Restore internal model based on weights
+        sampler = OptunaSampler(None)
+        n_inputs, n_outputs = next(iter(state['model'].values())).shape[-1], 1
+        estimator.model_ = sampler.sample_network(n_inputs, n_outputs, estimator.hidden_layer_sizes,
+                                                  estimator.activation, estimator.dropout)
+        estimator.model_.load_state_dict(state['model'])
+        estimator.model_.to(device)
+        return estimator
