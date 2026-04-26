@@ -8,6 +8,7 @@ from sklearn.base import BaseEstimator
 from sklearn.model_selection import StratifiedKFold
 from sklearn.utils.validation import check_is_fitted, validate_data
 from sksurv.base import SurvivalAnalysisMixin
+from sksurv.linear_model.coxph import BreslowEstimator
 from sksurv.util import check_array_survival
 
 from torch_survival.losses import cox_neg_log_likelihood
@@ -146,7 +147,8 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
 
         Returns
         -------
-        self
+        self: DeepSurv
+            The trained estimator.
         """
         # Validate and extract data
         X, y = validate_data(self, X, y)
@@ -179,6 +181,10 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
                                              range(best_params.pop('n_layers'))]
         self.set_params(**best_params)
 
+        # Fit baseline risk estimator using Breslow
+        risk_scores = self.model_(X).detach().squeeze(dim=-1).cpu().numpy()
+        self.baseline_ = BreslowEstimator().fit(risk_scores, y_event.cpu().numpy(), y_time.cpu().numpy())
+
         return self
 
     @torch.no_grad()
@@ -203,6 +209,64 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         X = torch.as_tensor(X, dtype=torch.float32, device=self.device)
         return self.model_(X).detach().squeeze(dim=-1).cpu().numpy()
 
+    def predict_cumulative_hazard_function(self, X, return_array=False):
+        r"""Predict cumulative hazard function.
+
+        The cumulative hazard function for an individual with feature vector :math:`x` is defined as
+
+        .. math::
+
+            h(t \mid x) = h_0(t) e^{\hat{h}(x)},
+
+        where :math:`h_0(t)` is the baseline hazard function, estimated by Breslow's estimator, and :math:`\hat{h}(x)`
+        is the time-independent proportional risk estimated by DeepSurv.
+
+        Parameters
+        ----------
+        X : array-like, shape = (n_samples, n_features)
+            Data matrix.
+        return_array: bool, default=False
+            Determines whether to return a 2D array of cumulative hazard values of shape `(n_samples, n_unique_times)`
+            (if `True`) or a 1D array of :class:`sksurv.functions.StepFunction` objects (if `False`).
+
+        Returns
+        -------
+        cum_hazard: ndarray, shape = (n_samples, n_unique_times) or (n_samples,)
+            If `return_array` is False, array of `n_samples` :class:`sksurv.functions.StepFunction` objects.
+            If `return_array` is True, numeric array of shape `(n_samples, n_unique_times)`, where
+            `n_unique_times` is the number of unique event times in the training data.
+        """
+        return self._predict_cumulative_hazard_function(self.baseline_, self.predict(X), return_array)
+
+    def predict_survival_function(self, X, return_array=False):
+        r"""Predict survival function.
+
+        The survival function for an individual with feature vector :math:`x` is defined as
+
+        .. math::
+
+            S(t \mid x) = S_0(t)^{e^{\hat{h}(x)}},
+
+        where :math:`S_0(t)` is the baseline survival function, estimated by Breslow's estimator, and :math:`\hat{h}(x)`
+        is the time-independent proportional risk estimated by DeepSurv.
+
+        Parameters
+        ----------
+        X : array-like, shape = (n_samples, n_features)
+            Data matrix.
+        return_array: bool, default=False
+            Determines whether to return a 2D array of survival probabilities of shape `(n_samples, n_unique_times)`
+            (if `True`) or a 1D array of :class:`sksurv.functions.StepFunction` objects (if `False`).
+
+        Returns
+        -------
+        survival_prob: ndarray, shape = (n_samples, n_unique_times) or (n_samples,)
+            If `return_array` is False, array of `n_samples` :class:`sksurv.functions.StepFunction` objects.
+            If `return_array` is True, numeric array of shape `(n_samples, n_unique_times)`, where
+            `n_unique_times` is the number of unique event times in the training data.
+        """
+        return self._predict_survival_function(self.baseline_, self.predict(X), return_array)
+
     def save(self, path):
         """ Save a trained model to disk.
 
@@ -218,6 +282,7 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         state = {
             'params': self.get_params(),
             'model': self.model_.state_dict(),
+            'baseline': self.baseline_,
         }
         torch.save(state, path)
 
@@ -240,7 +305,7 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         # Note: Device handled manually as users may wish to use a device different from the original when restoring
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        state = torch.load(path, map_location=device, weights_only=True)
+        state = torch.load(path, map_location=device, weights_only=False)
         # Reload estimator with initial parameters
         params = state['params']
         params['device'] = device
@@ -252,4 +317,6 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
                                                   estimator.activation, estimator.dropout)
         estimator.model_.load_state_dict(state['model'])
         estimator.model_.to(device)
+        # Restore internal baseline risk estimator using Breslow
+        estimator.baseline_ = state['baseline']
         return estimator
