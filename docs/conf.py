@@ -3,6 +3,12 @@
 # For the full list of built-in configuration values, see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
+# Add package sources for autodoc
+# @see https://www.sphinx-doc.org/en/master/usage/extensions/autodoc.html#getting-started
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path('..', 'src').resolve()))
+
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
