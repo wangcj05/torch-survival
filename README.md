@@ -1,7 +1,9 @@
-<p align="center">
+<div align="center">
   <img width="150rem" alt="torch-survival Logo" src="https://github.com/taltstidl/torch-survival/blob/main/assets/logo.svg" />
   <h1 align="center">torch-survival: A PyTorch-based library for Deep Survival Analysis</h1>
-</p>
+
+  [![docs](https://github.com/taltstidl/torch-survival/actions/workflows/docs.yaml/badge.svg)](https://github.com/taltstidl/torch-survival/actions/workflows/docs.yaml) 
+</div>
 
 **`torch-survival`** is a library built upon [PyTorch](https://pytorch.org) and [scikit-survival](https://github.com/sebp/scikit-survival) to make survival analysis using deep learning more accessible.
 
