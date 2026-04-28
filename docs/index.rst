@@ -63,6 +63,7 @@ While **torch-survival** is the first comprehensive and production-ready library
    :hidden:
 
    deepsurv
+   rankdeepsurv
 
 .. toctree::
    :maxdepth: 2

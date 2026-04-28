@@ -1,7 +1,5 @@
 import functools
 import warnings
-from copy import deepcopy
-from typing import TypedDict
 
 import optuna
 import torch
@@ -12,61 +10,98 @@ from sklearn.utils.validation import check_is_fitted, validate_data
 from sksurv.base import SurvivalAnalysisMixin
 from sksurv.util import check_array_survival
 
-from torch_survival.config import NetworkConfig, OptimizerConfig
 from torch_survival.metrics import concordance_index
 from torch_survival.progress import OptunaProgressCallback
-from torch_survival.sample import sample_network, sample_optimizer
-from torch_survival.utils import merge_configs
-
-
-class RankDeepSurvSearchSpace(TypedDict):
-    #: Neural network configuration
-    network: NetworkConfig
-    #: Optimizer configuration
-    optimizer: OptimizerConfig
-    #: Number of pairs to process in each batch
-    batch_size: tuple[int, int] | int
-    #: Weight for ranking loss
-    alpha: tuple[float, float] | float
+from torch_survival.sample import OptunaSampler, TunedTopology, TunedCategorical, TunedFloat
 
 
 class RankDeepSurv(SurvivalAnalysisMixin, BaseEstimator):
     r""" Implements the RankDeepSurv model presented by Jing et al. [1]_.
 
     Uses a deep neural network trained with a mean squared error and ranking loss, adapted for censoring, to estimate
-    the survival time of each individual. The network's configuration is tuned using a random solver.
+    the survival time of each individual. This implementation tries to stay faithful to the original paper, with the
+    following deviations:
+
+    * Neither the original paper nor the provided implementation state how hyperparameters are derived. We use Optuna's
+      default TPE sampler with 5-fold internal cross-validation here.
+    * The original loss formulation uses separate :math:`\alpha` and :math:`\beta` weights for the regression and
+      ranking loss, respectively. We instead use only a single :math:`\alpha` such that :math:`\mathcal{L}=
+      \alpha \mathcal{L}_{mse} + (1-\alpha) \mathcal{L}_{rank}`.
+    * Our implementation does not support or tune :math:`\ell_2` regularization. We found this to be detrimental to
+      performance and were unable to fully replicate the described weight regularization.
+
+    .. note::
+       As the model predicts a single expected survival time, it does not support predicting either a cumulative hazard
+       function or a survival function. This is not an omission but a fundamental consequence of the model's design.
 
     .. [1] B. Jing et al., “A deep survival analysis method based on ranking,” Artificial Intelligence in Medicine, vol.
        98, pp. 1–9, July 2019, doi: 10.1016/j.artmed.2019.06.001. Available:
        http://dx.doi.org/10.1016/j.artmed.2019.06.001
+
+    Parameters
+    ----------
+    hidden_layer_sizes: list of ints or TunedTopology, default=TunedTopology(n_layers=4, n_neurons=50)
+        If a list, the ith element represents the number of neurons in the ith hidden layer. Alternatively, a tunable
+        topology specifies the maximum number of layers and of neurons per layer.
+    activation: {'relu', 'selu'} or TunedCategorical, default=TunedCategorical(choices=['relu', 'selu'])
+        Activation function for the hidden layer.
+    dropout: float or TunedFloat, default=TunedFloat(low=0.0, high=0.5)
+        Dropout probability for the hidden layer.
+    optimizer: {'sgd', 'adam'} or TunedCategorical, default=TunedCategorical(choices=['sgd', 'adam'])
+        Optimizer used for weight optimization.
+    learning_rate: float or TunedFloat, default=TunedFloat(low=1e-7, high=1e-3, log=True)
+        Initial learning rate used when optimizing weights.
+    momentum: float or TunedFloat, default=TunedFloat(low=0.8, high=0.95)
+        Momentum or first moment vector
+    scheduler: {'inverse_time'} or TunedCategorical, default='inverse_time'
+        Scheduler used for weight updates.
+    decay: float or TunedFloat, default=TunedFloat(low=0.0, high=0.001)
+        Decay used by scheduler when updating learning rate.
+    alpha: float or TunedFloat, default=TunedFloat(low=0.0, high=1.0)
+        Weight term for regression and ranking loss, with :math:`\mathcal{L}=\alpha \mathcal{L}_{mse} + (1-\alpha)
+        \mathcal{L}_{rank}`.
+    batch_size: int or TunedInt, default=128
+        Size of minibatches, here the number of pairs as training iterates over pairs of compatible samples.
+    n_epochs: int, default=500
+        Number of training epochs (how many times each pair of compatible samples will be used).
+    n_trials: int, default=50
+        Number of hyperparameter optimization trials. Only relevant if tunable parameters are passed.
+    random_state: int, default=None
+        Determines random number generation for hyperparameter optimization and weight initialization. Pass an int for
+        reproducible results across multiple function calls.
+    device: str or torch.device, default=None
+        Device on which tensors will be allocated. If None, uses CUDA if available, else CPU.
     """
 
-    #: Default hyperparameter search space
-    default_search_space: RankDeepSurvSearchSpace = {
-        'network': {
-            'layers': {
-                'max_layers': 4,
-                'max_nodes_per_layer': 50,
-            },
-            'activation': ['relu', 'selu'],
-            'dropout': (0.0, 0.5),
-        },
-        'optimizer': {
-            'name': ['sgd', 'adam'],
-            'lr': (10e-7, 10e-3),
-            'scheduler': 'inverse_time',
-            'decay': (0.0, 0.001),
-            'momentum': (0.8, 0.95),
-        },
-        'batch_size': 128,
-        'alpha': (0, 1),
-    }
-
-    def __init__(self, search_space: RankDeepSurvSearchSpace | None = None, n_epochs=1, random_state=None, device=None):
-        self.search_space = deepcopy(self.default_search_space)
-        if search_space:
-            self.search_space = merge_configs(self.search_space, search_space)
+    def __init__(
+            self,
+            hidden_layer_sizes=TunedTopology(n_layers=4, n_neurons=50),
+            activation=TunedCategorical(choices=['relu', 'selu']),
+            dropout=TunedFloat(low=0.0, high=0.5),
+            optimizer=TunedCategorical(choices=['sgd', 'adam']),
+            learning_rate=TunedFloat(low=1e-6, high=1e-2, log=True),
+            momentum=TunedFloat(low=0.8, high=0.95),
+            scheduler='inverse_time',
+            decay=TunedFloat(low=0.0, high=0.001),
+            alpha=TunedFloat(low=0.0, high=1.0),
+            batch_size=128,
+            n_epochs=500,
+            n_trials=50,
+            random_state=None,
+            device=None,
+    ):
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.activation = activation
+        self.dropout = dropout
+        self.optimizer = optimizer
+        self.learning_rate = learning_rate
+        self.momentum = momentum
+        self.scheduler = scheduler
+        self.decay = decay
+        self.alpha = alpha
+        self.batch_size = batch_size
         self.n_epochs = n_epochs
+        self.n_trials = n_trials
         self.random_state = random_state
         self.device = device
         if self.device is None:
@@ -84,10 +119,13 @@ class RankDeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         return sum(scores) / len(scores)
 
     def _train(self, trial, X, y_event, y_time):
+        sampler = OptunaSampler(trial)
+
         # Set up model, optimizer, and scheduler
         n_inputs, n_outputs = X.shape[-1], 1
-        model = sample_network(trial, self.search_space['network'], n_inputs, n_outputs)
-        optimizer, scheduler = sample_optimizer(trial, self.search_space['optimizer'], model)
+        model = sampler.sample_network(n_inputs, n_outputs, self.hidden_layer_sizes, self.activation, self.dropout)
+        optimizer, scheduler = sampler.sample_optimizer(model, self.optimizer, self.learning_rate, self.momentum,
+                                                        self.scheduler, self.decay)
 
         # Extract data pair indices for ranking loss
         event_i, event_j = y_event.unsqueeze(-2), y_event.unsqueeze(-1)
@@ -97,12 +135,8 @@ class RankDeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         pairs = torch.nonzero(comp)  # of shape (n_pairs, 2)
 
         # Sample batch size and loss parameters
-        batch_size = self.search_space['batch_size']
-        if not isinstance(batch_size, int):
-            batch_size = trial.suggest_int('batch_size', *batch_size)
-        alpha = self.search_space['alpha']
-        if not isinstance(alpha, float):
-            alpha = trial.suggest_float('alpha', *alpha)
+        batch_size = sampler.sample_int('batch_size', self.batch_size)
+        alpha = sampler.sample_float('alpha', self.alpha)
 
         # Train and return model
         model.to(self.device)
@@ -143,7 +177,8 @@ class RankDeepSurv(SurvivalAnalysisMixin, BaseEstimator):
 
         Returns
         -------
-        self
+        self: RankDeepSurv
+            The trained estimator.
         """
         # Validate and extract data
         X, y = validate_data(self, X, y)
@@ -172,9 +207,14 @@ class RankDeepSurv(SurvivalAnalysisMixin, BaseEstimator):
             study.optimize(objective, n_trials=50, callbacks=[callback])
 
         # Train final model with best hyperparameters
-        self.optuna_params_ = study.best_params
         self.model_ = self._train(study.best_trial, X, y_event, y_time)
         self.model_.eval()
+
+        # Override internal parameters with tuned hyperparameters
+        best_params = study.best_params
+        best_params['hidden_layer_sizes'] = [best_params.pop('n_neurons_' + str(i + 1)) for i in
+                                             range(best_params.pop('n_layers'))]
+        self.set_params(**best_params)
 
         return self
 
@@ -200,6 +240,3 @@ class RankDeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         times = self.model_(X).detach().squeeze(dim=-1).cpu().numpy()
         times = times * self.time_horizon_  # undo normalization
         return times
-
-    def get_optuna_params(self):
-        return self.optuna_params_

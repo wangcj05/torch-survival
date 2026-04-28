@@ -52,7 +52,7 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         Momentum or first moment vector
     scheduler: {'inverse_time'} or TunedCategorical, default='inverse_time'
         Scheduler used for weight updates.
-    decay: float or TunedFloat(low=0.0, high=0.001)
+    decay: float or TunedFloat, default=TunedFloat(low=0.0, high=0.001)
         Decay used by scheduler when updating learning rate.
     n_epochs: int, default=500
         Number of training epochs (how many times each data point will be used).
