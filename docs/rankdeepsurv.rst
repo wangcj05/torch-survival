@@ -6,3 +6,5 @@ RankDeepSurv
    .. automethod:: fit
    .. automethod:: predict
    .. automethod:: score
+   .. automethod:: save
+   .. automethod:: load

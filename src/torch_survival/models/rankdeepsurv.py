@@ -240,3 +240,57 @@ class RankDeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         times = self.model_(X).detach().squeeze(dim=-1).cpu().numpy()
         times = times * self.time_horizon_  # undo normalization
         return times
+
+    def save(self, path):
+        """ Save a trained model to disk.
+
+        This saves the model's parameters (dictionary) and weights (tensors) such that the estimator can be fully
+        restored using :meth:`RankDeepSurv.load`. Internally relies on :meth:`torch.save`.
+
+        Parameters
+        ----------
+        path: str or file-like object or os.PathLike
+            Path at which to save the model.
+        """
+        check_is_fitted(self)
+        state = {
+            'params': self.get_params(),
+            'model': self.model_.state_dict(),
+            'time_horizon': self.time_horizon_,
+        }
+        torch.save(state, path)
+
+    @classmethod
+    def load(cls, path, device=None):
+        """ Reload an already trained model.
+
+        Parameters
+        ----------
+        path: str or file-like object or os.PathLike
+            Path from which to load the model. See also :meth:`RankDeepSurv.save` for additional details.
+        device: str or torch.device, default=None
+            Device on which tensors will be allocated. If None, uses CUDA if available, else CPU.
+
+        Returns
+        -------
+        model: RankDeepSurv
+            The trained estimator.
+        """
+        # Note: Device handled manually as users may wish to use a device different from the original when restoring
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        state = torch.load(path, map_location=device)
+        # Reload estimator with initial parameters
+        params = state['params']
+        params['device'] = device
+        estimator = cls(**params)
+        # Restore internal model based on weights
+        sampler = OptunaSampler(None)
+        n_inputs, n_outputs = next(iter(state['model'].values())).shape[-1], 1
+        estimator.model_ = sampler.sample_network(n_inputs, n_outputs, estimator.hidden_layer_sizes,
+                                                  estimator.activation, estimator.dropout)
+        estimator.model_.load_state_dict(state['model'])
+        estimator.model_.to(device)
+        # Restore time horizon for predictions
+        estimator.time_horizon_ = state['time_horizon']
+        return estimator
