@@ -166,20 +166,22 @@ class DeepSurv(SurvivalAnalysisMixin, BaseEstimator):
         # Optimize hyperparameters
         optuna.logging.disable_default_handler()
         warnings.filterwarnings('ignore', category=optuna.exceptions.ExperimentalWarning)
-        with OptunaProgressCallback(model_name='DeepSurv', n_trials=50) as callback:
+        with OptunaProgressCallback(model_name='DeepSurv', n_trials=self.n_trials) as callback:
             study = optuna.create_study(sampler=TPESampler(seed=self.random_state) if self.random_state else None)
             objective = functools.partial(self._optimize, X=X, y_event=y_event, y_time=y_time)
-            study.optimize(objective, n_trials=50, callbacks=[callback])
+            study.optimize(objective, n_trials=self.n_trials, callbacks=[callback])
 
         # Train final model with best hyperparameters
         self.model_ = self._train(study.best_trial, X, y_event, y_time)
         self.model_.eval()
 
         # Override internal parameters with tuned hyperparameters
-        best_params = study.best_params
-        best_params['hidden_layer_sizes'] = [best_params.pop('n_neurons_' + str(i + 1)) for i in
-                                             range(best_params.pop('n_layers'))]
-        self.set_params(**best_params)
+        best_params = dict(study.best_params)
+        if not isinstance(self.hidden_layer_sizes, list):
+            best_params['hidden_layer_sizes'] = [best_params.pop('n_neurons_' + str(i + 1)) for i in
+                                                 range(best_params.pop('n_layers'))]
+        if best_params:
+            self.set_params(**best_params)
 
         # Fit baseline risk estimator using Breslow
         risk_scores = self.model_(X).detach().squeeze(dim=-1).cpu().numpy()
