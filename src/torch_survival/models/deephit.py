@@ -23,31 +23,29 @@ from torch_survival.utils import merge_configs
 
 
 class DeepHitNetwork(nn.Module):
-    def __init__(self, n_inputs, n_times):
+    def __init__(
+            self,
+            n_inputs,
+            n_times,
+            hidden_layer_sizes=(32, 16),
+            dropout=0.1,
+            batch_norm=True,
+    ):
         super().__init__()
-        n_inputs_min = min(n_inputs, 100)
-        if n_inputs > 10_000:
-            n_inputs_min = 50  # Guard against wide datasets
-        self.shared_network = nn.Sequential(
-            nn.Linear(n_inputs, 3 * n_inputs_min),
-            nn.ReLU(),
-            nn.Dropout(p=0.6),
-        )
-        self.cause_network = nn.Sequential(
-            # input consists of shared network output + features
-            nn.Linear(3 * n_inputs_min + n_inputs, 5 * n_inputs_min),
-            nn.ReLU(),
-            nn.Dropout(p=0.6),
-            nn.Linear(5 * n_inputs_min, 3 * n_inputs_min),
-            nn.ReLU(),
-            nn.Dropout(p=0.6),
-            nn.Linear(3 * n_inputs_min, n_times),
-        )
+        layers = []
+        n_nodes = n_inputs
+        for nodes in hidden_layer_sizes:
+            layers.append(nn.Linear(n_nodes, nodes))
+            if batch_norm:
+                layers.append(nn.BatchNorm1d(nodes))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(p=dropout))
+            n_nodes = nodes
+        layers.append(nn.Linear(n_nodes, n_times))
+        self.network = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = torch.concat((self.shared_network(x), x), dim=-1)
-        x = self.cause_network(x)
-        return x
+        return self.network(x)
 
 
 class DeepHitSearchSpace(TypedDict):
@@ -72,17 +70,36 @@ class DeepHit(SurvivalAnalysisMixin, BaseEstimator):
 
     #: Default hyperparameter search space
     default_search_space: DeepHitSearchSpace = {
-        'n_times': (10, 500),
-        'alpha': (0, 1),
-        'sigma': (1e-3, 1e1),
+        'n_times': (20, 100),
+        'alpha': (0.0, 0.6),
+        'sigma': (0.05, 1.0),
     }
 
-    def __init__(self, search_space: DeepHitSearchSpace | None = None, n_epochs=100, batch_size=50, random_state=None, device=None):
+    def __init__(
+            self,
+            search_space: DeepHitSearchSpace | None = None,
+            hidden_layer_sizes=(32, 16),
+            dropout=0.1,
+            batch_norm=True,
+            learning_rate=1e-3,
+            n_epochs=100,
+            batch_size=64,
+            patience=10,
+            n_trials=25,
+            random_state=None,
+            device=None,
+    ):
         self.search_space = deepcopy(self.default_search_space)
         if search_space:
             self.search_space = merge_configs(self.search_space, search_space)
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.dropout = dropout
+        self.batch_norm = batch_norm
+        self.learning_rate = learning_rate
         self.n_epochs = n_epochs
         self.batch_size = batch_size
+        self.patience = patience
+        self.n_trials = n_trials
         self.random_state = random_state
         self.device = device
         if self.device is None:
@@ -116,17 +133,25 @@ class DeepHit(SurvivalAnalysisMixin, BaseEstimator):
 
         # Sample loss parameters
         alpha = self.search_space['alpha']
-        if not isinstance(alpha, float):
+        if not isinstance(alpha, (int, float)):
             alpha = trial.suggest_float('alpha', *alpha)
+        alpha = float(alpha)
         sigma = self.search_space['sigma']
-        if not isinstance(sigma, float):
+        if not isinstance(sigma, (int, float)):
             sigma = trial.suggest_float('sigma', *sigma, log=True)
+        sigma = float(sigma)
 
         # Train and return model
-        net = DeepHitNetwork(n_inputs, y_trans.out_features)
-        model = DeepHitSingle(net, tt.optim.Adam(lr=1e-4), duration_index=y_trans.cuts,
+        net = DeepHitNetwork(
+            n_inputs,
+            y_trans.out_features,
+            hidden_layer_sizes=self.hidden_layer_sizes,
+            dropout=self.dropout,
+            batch_norm=self.batch_norm,
+        )
+        model = DeepHitSingle(net, tt.optim.Adam(lr=self.learning_rate), duration_index=y_trans.cuts,
                               alpha=alpha, sigma=sigma, device=self.device)
-        callbacks = [tt.callbacks.EarlyStopping(patience=10)]
+        callbacks = [tt.callbacks.EarlyStopping(patience=self.patience)]
         model.fit(X_train, y_train, batch_size=self.batch_size, epochs=self.n_epochs, callbacks=callbacks,
                   val_data=(X_val, y_val), verbose=False)
         return model, y_trans.cuts
@@ -159,10 +184,10 @@ class DeepHit(SurvivalAnalysisMixin, BaseEstimator):
         # Optimize hyperparameters
         optuna.logging.disable_default_handler()
         warnings.filterwarnings('ignore', category=optuna.exceptions.ExperimentalWarning)
-        with OptunaProgressCallback(model_name='DeepHit', n_trials=50) as callback:
+        with OptunaProgressCallback(model_name='DeepHit', n_trials=self.n_trials) as callback:
             study = optuna.create_study(sampler=TPESampler(seed=self.random_state) if self.random_state else None)
             objective = functools.partial(self._optimize, X=X, y_event=y_event, y_time=y_time)
-            study.optimize(objective, n_trials=50, callbacks=[callback])
+            study.optimize(objective, n_trials=self.n_trials, callbacks=[callback])
 
         # Train model
         self.optuna_params_ = study.best_params
